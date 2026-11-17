@@ -3133,9 +3133,15 @@ class BackwardContext:
   contact_phi: array("naconmax", float)
   contact_point: array("naconmax", wp.vec3)
   contact_feature: array("naconmax", wp.vec4i)
+  contact_frame0: array("naconmax", wp.mat33)
+  contact_jac_inv: array("naconmax", wp.mat44)
+  contact_residual0: array("naconmax", wp.vec4)
   contact_adj_dist: array("naconmax", float)
   res_geom_xpos: array("nworld", "ngeom", wp.vec3)
   res_geom_xmat: array("nworld", "ngeom", wp.mat33)
+  res_site_xpos: array("nworld", "nsite", wp.vec3)
+  adj_ten_length: array("nworld", "ntendon", float)
+  adj_ten_J: array("nworld", "nJten", float)
   contact_res_dof: array("nworld", "nv", float)
   contact_ceff: array("nworld", "nbody", wp.vec3)
   res_dof: array("nworld", "nv", float)
@@ -3153,6 +3159,11 @@ class BackwardContext:
   res_eq_solimp: wp.array
   res_jnt_solref: wp.array
   res_jnt_solimp: wp.array
+  res_tendon_solref_lim: wp.array
+  res_tendon_solimp_lim: wp.array
+  res_tendon_solref_fri: wp.array
+  res_tendon_solimp_fri: wp.array
+  res_tendon_frictionloss: wp.array
   smooth_res_qpos: array("nworld", "nq", float)
   smooth_res_dof: array("nworld", "nv", float)
   smooth_adj_qvel: array("nworld", "nv", float)

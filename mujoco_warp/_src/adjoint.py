@@ -40,6 +40,7 @@ from mujoco_warp._src import model_adjoint
 from mujoco_warp._src import smooth
 from mujoco_warp._src import smooth_kinematics_adjoint
 from mujoco_warp._src import solver
+from mujoco_warp._src import tendon_adjoint
 from mujoco_warp._src.types import TILE_SIZE_JTDAJ_DENSE
 from mujoco_warp._src.types import BackwardContext
 from mujoco_warp._src.types import BiasType
@@ -54,6 +55,7 @@ from mujoco_warp._src.types import JointType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import SolverType
 from mujoco_warp._src.types import TrnType
+from mujoco_warp._src.types import WrapType
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 from mujoco_warp._src.warp_util import is_array_spec
@@ -107,7 +109,23 @@ def _model_supported(m: Model) -> tuple[tuple[str, ...], frozenset[str]]:
   ):
     reasons.append("non-identity actuator/control mapping (requires one control per actuator in actuator order)")
   if m.ntendon:
-    reasons.append("tendons (spring/bias/armature/transmission)")
+    if np.any(m.tendon_armature.numpy() != 0.0):
+      reasons.append("tendon armature (tendon_armature / tendon_bias)")
+    if np.any(m.tendon_actfrclimited.numpy()):
+      reasons.append("tendon actuator force limits (tendon_actfrclimited)")
+    if (
+      m.nwrap
+      and not np.isin(
+        m.wrap_type.numpy(),
+        (WrapType.JOINT, WrapType.PULLEY, WrapType.SITE, WrapType.SPHERE, WrapType.CYLINDER),
+      ).all()
+    ):
+      reasons.append("unsupported tendon wrap type")
+    if m.wrap_jnt_adr.size:
+      jnt_type = m.jnt_type.numpy()
+      ten_jnt_ids = m.wrap_objid.numpy()[m.wrap_jnt_adr.numpy()]
+      if np.any((jnt_type[ten_jnt_ids] == JointType.FREE) | (jnt_type[ten_jnt_ids] == JointType.BALL)):
+        reasons.append("fixed tendon wrapping a FREE/BALL joint")
   if m.nplastic:
     reasons.append("plastic joint state")
   if m.has_fluid:
@@ -133,18 +151,18 @@ def _model_supported(m: Model) -> tuple[tuple[str, ...], frozenset[str]]:
     dyntype = m.actuator_dyntype.numpy()
     stateful = m.actuator_actadr.numpy() >= 0
     jnt_type = m.jnt_type.numpy()
-    if np.any(trntype != TrnType.JOINT):
-      reasons.append("non-JOINT actuator transmission (tendon/site/body/slider-crank/jointinparent)")
+    if not np.isin(trntype, (TrnType.JOINT, TrnType.TENDON)).all():
+      reasons.append("unsupported actuator transmission (site/body/slider-crank/jointinparent)")
+    if np.any(m.actuator_armature.numpy()[:, trntype == TrnType.TENDON] != 0.0):
+      reasons.append("tendon actuator armature (actuator_armature / tendon_bias)")
     if (
-      not ((gaintype == GainType.FIXED) | (gaintype == GainType.AFFINE)).all()
-      or not ((biastype == BiasType.NONE) | (biastype == BiasType.AFFINE)).all()
+      not np.isin(gaintype, (GainType.FIXED, GainType.AFFINE, GainType.MUSCLE)).all()
+      or not np.isin(biastype, (BiasType.NONE, BiasType.AFFINE, BiasType.MUSCLE)).all()
     ):
-      reasons.append("non-affine actuator gain/bias (muscle/DC-motor/user)")
+      reasons.append("unsupported actuator gain/bias (DC-motor/user)")
     jnt_ids = m.actuator_trnid.numpy()[:, 0][trntype == TrnType.JOINT]
     if jnt_ids.size and np.any((jnt_type[jnt_ids] == JointType.FREE) | (jnt_type[jnt_ids] == JointType.BALL)):
       reasons.append("actuator on a FREE/BALL joint (quaternion-dependent transmission length)")
-    if np.any(stateful & (gaintype == GainType.AFFINE)):
-      reasons.append("stateful (na>0) AFFINE-gain actuator (ctrl_act=act not implemented)")
     scalar_dynamics = np.isin(dyntype, (DynType.INTEGRATOR, DynType.FILTER, DynType.FILTEREXACT, DynType.MUSCLE))
     if np.any(stateful & (~scalar_dynamics | (m.actuator_actnum.numpy() != 1))):
       reasons.append("non-scalar or user/DC-motor activation dynamics")
@@ -199,6 +217,11 @@ def _create_backward_context(m: Model, d: Data) -> BackwardContext:
     res_eq_solimp=wp.zeros_like(m.eq_solimp),
     res_jnt_solref=wp.zeros_like(m.jnt_solref),
     res_jnt_solimp=wp.zeros_like(m.jnt_solimp),
+    res_tendon_solref_lim=wp.zeros_like(m.tendon_solref_lim),
+    res_tendon_solimp_lim=wp.zeros_like(m.tendon_solimp_lim),
+    res_tendon_solref_fri=wp.zeros_like(m.tendon_solref_fri),
+    res_tendon_solimp_fri=wp.zeros_like(m.tendon_solimp_fri),
+    res_tendon_frictionloss=wp.zeros_like(m.tendon_frictionloss),
     res_body_mass=wp.zeros_like(m.body_mass),
     res_body_inertia=wp.zeros_like(m.body_inertia),
     res_body_ipos=wp.zeros_like(m.body_ipos),
@@ -237,8 +260,8 @@ def _assert_step_supported(m: Model):
     raise NotImplementedError("adjoint.step_backward does not support caller-supplied contacts (run_collision_detection=False)")
   if m.opt.enableflags & EnableBit.SLEEP and not (m.opt.disableflags & DisableBit.ISLAND):
     raise NotImplementedError("adjoint.step_backward does not support sleep")
-  if m.eq_connect_adr.size or m.eq_wld_adr.size or m.ntendon or m.nflex:
-    raise NotImplementedError("adjoint.step_backward does not support connect/weld equality, tendon, or flex constraint rows")
+  if m.eq_connect_adr.size or m.eq_wld_adr.size or m.nflex:
+    raise NotImplementedError("adjoint.step_backward does not support connect/weld equality or flex constraint rows")
   callbacks = []
   if not (m.opt.disableflags & DisableBit.ACTUATION):
     callbacks.append("control")
@@ -333,8 +356,10 @@ def _residual_constraint_sparse(
       nv,
       m.jnt_dofadr,
       m.dof_invweight0,
+      m.eq_type,
       m.eq_obj1id,
       m.eq_obj2id,
+      m.tendon_invweight0,
       d_bwd.nefc,
       d_bwd.efc.type,
       d_bwd.efc.id,
@@ -382,12 +407,21 @@ def _residual_constraint_sparse(
       m.jnt_type,
       m.jnt_qposadr,
       m.jnt_dofadr,
+      m.eq_type,
+      m.eq_obj1id,
       m.eq_obj2id,
       m.eq_data,
+      m.ten_J_rownnz,
+      m.ten_J_rowadr,
+      m.ten_J_colind,
+      m.tendon_range,
+      m.tendon_length0,
       d_bwd.nefc,
       d.qpos,
       d.qvel,
       d_bwd.qacc,
+      d_bwd.ten_J,
+      d_bwd.ten_length,
       d_bwd.efc.type,
       d_bwd.efc.id,
       d_bwd.efc.J_rownnz,
@@ -402,7 +436,7 @@ def _residual_constraint_sparse(
       efc_Z,
       efc_Z.grad,
     ],
-    outputs=[res_qvel, res_dof],
+    outputs=[res_qvel, res_dof, bc.adj_ten_length, bc.adj_ten_J],
   )
 
   model_adjoint.constraint_params_backward(m, bc)
@@ -418,8 +452,13 @@ def noncontact_constraint_backward(
   res_qvel: wp.array,
   ctx_Jaref: wp.array,
   bc: BackwardContext,
+  *,
+  defer_tendon_kinematics: bool = False,
 ):
   """Accumulates non-contact residuals in input position and velocity space."""
+  if not defer_tendon_kinematics and m.ntendon:
+    bc.adj_ten_length.zero_()
+    bc.adj_ten_J.zero_()
   _residual_constraint_sparse(m, d, d_bwd, ctx_Jaref, lam, res_qvel, bc.res_dof, bc)
   wp.launch(
     smooth_kinematics_adjoint._dof_to_qpos,
@@ -427,6 +466,12 @@ def noncontact_constraint_backward(
     inputs=[m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, d.qpos, bc.res_dof],
     outputs=[res_qpos],
   )
+  if not defer_tendon_kinematics and m.ntendon:
+    tendon_adjoint.tendon_kinematics_vjp(m, d_bwd, d.qpos, bc.adj_ten_length, bc.adj_ten_J, res_qpos, bc)
+    if (d.mocap_pos.grad is not None or d.mocap_quat.grad is not None) and (
+      m.wrap_site_pair_adr.size > 0 or m.wrap_geom_adr.size > 0
+    ):
+      smooth_kinematics_adjoint.kinematics_mocap_backward(m, d_bwd, bc, tendon=True)
 
 
 def _residual_contact(
@@ -580,14 +625,37 @@ def _write_input_adjoints(d: Data, bc: BackwardContext):
 
 
 @event_scope
-def forward_backward_ift(m: Model, d: Data, d_bwd: Data, adj_qacc: wp.array, bc: BackwardContext):
+def forward_backward_ift(
+  m: Model,
+  d: Data,
+  d_bwd: Data,
+  adj_qacc: wp.array,
+  bc: BackwardContext,
+  *,
+  adj_act_out_seed: wp.array | None = None,
+  adj_act_dot_out_seed: wp.array | None = None,
+):
   """Differentiates forward dynamics at the converged acceleration."""
   solver_ctx = solve_backward(m, d_bwd, adj_qacc, bc)
   lam = solver_ctx.search
+  if m.ntendon:
+    bc.adj_ten_length.zero_()
+    bc.adj_ten_J.zero_()
   if d_bwd.njmax and m.nv:
     contact_constraint_backward(m, d, d_bwd, lam, bc.res_qpos, bc.res_qvel, bc)
-    noncontact_constraint_backward(m, d, d_bwd, lam, bc.res_qpos, bc.res_qvel, solver_ctx.Jaref, bc)
-  forward_adjoint.smooth_qvel_backward(m, d, d_bwd, lam, bc.adj_qvel, bc)
+    noncontact_constraint_backward(
+      m, d, d_bwd, lam, bc.res_qpos, bc.res_qvel, solver_ctx.Jaref, bc, defer_tendon_kinematics=True
+    )
+  forward_adjoint.smooth_qvel_backward(
+    m,
+    d,
+    d_bwd,
+    lam,
+    bc.adj_qvel,
+    bc,
+    adj_act_out_seed=adj_act_out_seed,
+    adj_act_dot_out_seed=adj_act_dot_out_seed,
+  )
   forward_adjoint.smooth_qpos_backward(m, d, d_bwd, lam, bc.res_qpos, bc)
   # The position reverse also computes the RNE velocity cotangents. Consume them
   # with the residual sign before parameter VJPs reuse the workspace.
@@ -633,11 +701,16 @@ _STEP_MODEL_FIELDS = (
   "dof_frictionloss",
   "eq_solref",
   "eq_solimp",
+  "tendon_solref_lim",
+  "tendon_solimp_lim",
+  "tendon_solref_fri",
+  "tendon_solimp_fri",
+  "tendon_frictionloss",
   "geom_friction",
   "pair_friction",
 )
 _KINEMATICS_IN_FIELDS = ("qpos", "mocap_pos", "mocap_quat")
-_KINEMATICS_OUT_FIELDS = ("site_xpos", "xpos", "xquat")
+_KINEMATICS_OUT_FIELDS = ("site_xpos", "xpos", "xquat", "ten_length", "ten_J")
 
 
 def _data_arrays(d: Data, fields: tuple[str, ...], *, force_grad: bool = True) -> list[wp.array]:
@@ -733,6 +806,8 @@ def _accum_kinematics_adjoints(
   adj_site_xpos_out: wp.array2d[wp.vec3],
   adj_xpos_out: wp.array2d[wp.vec3],
   adj_xquat_out: wp.array2d[wp.quat],
+  adj_ten_length_out: wp.array2d[float],
+  adj_ten_J_out: wp.array2d[float],
 ):
   w, i = wp.tid()
   if adj_qpos_out and i < adj_qpos_out.shape[1]:
@@ -747,6 +822,10 @@ def _accum_kinematics_adjoints(
     adj_xpos_out[w, i] = wp.vec3()
   if adj_xquat_out and i < adj_xquat_out.shape[1]:
     adj_xquat_out[w, i] = wp.quat(0.0, 0.0, 0.0, 0.0)
+  if adj_ten_length_out and i < adj_ten_length_out.shape[1]:
+    adj_ten_length_out[w, i] = 0.0
+  if adj_ten_J_out and i < adj_ten_J_out.shape[1]:
+    adj_ten_J_out[w, i] = 0.0
 
 
 def _write_kinematics_adjoints(d: Data, bc: BackwardContext):
@@ -758,6 +837,8 @@ def _write_kinematics_adjoints(d: Data, bc: BackwardContext):
     d.site_xpos.grad,
     d.xpos.grad,
     d.xquat.grad,
+    d.ten_length.grad,
+    d.ten_J.grad,
   ]
   wp.launch(
     _accum_kinematics_adjoints,
@@ -797,7 +878,7 @@ def step_backward_scratch(m: Model, d: Data, d_out: Data, bc: BackwardContext) -
     ctrl=d.ctrl,
     mocap_pos=d.mocap_pos,
     mocap_quat=d.mocap_quat,
-    act=d_out.act,
+    act=d.act,
     act_dot=d_out.act_dot,
     qacc=d_out.qacc,
     xpos=d_kin.xpos,
@@ -805,11 +886,17 @@ def step_backward_scratch(m: Model, d: Data, d_out: Data, bc: BackwardContext) -
     xmat=d_kin.xmat,
     xipos=d_kin.xipos,
     ximat=d_kin.ximat,
+    xanchor=d_kin.xanchor,
+    xaxis=d_kin.xaxis,
     geom_xpos=d_kin.geom_xpos,
     geom_xmat=d_kin.geom_xmat,
+    site_xpos=d_kin.site_xpos,
+    site_xmat=d_kin.site_xmat,
     subtree_com=d_kin.subtree_com,
     cdof=d_kin.cdof,
     cinert=d_kin.cinert,
+    ten_J=d_kin.ten_J,
+    ten_length=d_kin.ten_length,
     crb=d_out.crb,
     M=d_out.M,
     qLD=d_out.qLD,
@@ -818,6 +905,7 @@ def step_backward_scratch(m: Model, d: Data, d_out: Data, bc: BackwardContext) -
     cvel=d_out.cvel,
     cdof_dot=d_out.cdof_dot,
     cfrc_ext=d_out.cfrc_ext,
+    ten_velocity=d_out.ten_velocity,
     actuator_length=d_out.actuator_length,
     actuator_velocity=d_out.actuator_velocity,
     actuator_force=d_out.actuator_force,
@@ -867,9 +955,10 @@ def step_backward_scratch(m: Model, d: Data, d_out: Data, bc: BackwardContext) -
   )
   if kinematics_grad:
     # A later fwd_kinematics call may recompute d_out using d_out.qpos.
-    # Step backward needs kinematics and COM values computed from d.qpos.
+    # Step backward needs kinematics, COM, and tendon values computed from d.qpos.
     smooth.kinematics(m, d_bwd)
     smooth.com_pos(m, d_bwd)
+    smooth.tendon(m, d_bwd)
   return d_bwd
 
 
@@ -893,8 +982,17 @@ def _step_backward(m: Model, d: Data, d_out: Data, bc: BackwardContext | None = 
   kinematics_grad = bool(_data_arrays(d_out, _KINEMATICS_OUT_FIELDS, force_grad=False))
   if kinematics_grad:
     forward_adjoint.kinematics_backward(m, d_out, d_bwd, bc)
+    tendon_adjoint.tendon_kinematics_backward(m, d_out, d_bwd, bc)
   _, _, adj_qacc = forward_adjoint.advance_backward(m, d_out, d_bwd, bc)
-  forward_backward_ift(m, d, d_bwd, adj_qacc, bc)
+  forward_backward_ift(
+    m,
+    d,
+    d_bwd,
+    adj_qacc,
+    bc,
+    adj_act_out_seed=d_out.act.grad,
+    adj_act_dot_out_seed=d_out.act_dot.grad,
+  )
   _write_input_adjoints(d, bc)
   _write_user_adjoints(d, d_out, bc)
   if kinematics_grad:
@@ -914,14 +1012,21 @@ def fwd_kinematics_backward_scratch(d: Data, bc: BackwardContext) -> Data:
 
 @event_scope
 def fwd_kinematics_backward(m: Model, d: Data, bc: BackwardContext | None = None):
-  """Maps Cartesian body/site cotangents to qpos and mocap inputs."""
+  """Maps Cartesian body/site and tendon cotangents to qpos and mocap inputs."""
   kinematics_grad = bool(_data_arrays(d, _KINEMATICS_OUT_FIELDS, force_grad=False))
   if not kinematics_grad:
     return
   bc = bc or _ACTIVE_BACKWARD_CONTEXT.get() or _create_backward_context(m, d)
   d_bwd = fwd_kinematics_backward_scratch(d, bc)
-  smooth.kinematics1(m, d_bwd)
+  tendon_grad = bool(m.ntendon and (d.ten_length.requires_grad or d.ten_J.requires_grad))
+  if tendon_grad and (m.wrap_site_pair_adr.size > 0 or m.wrap_geom_adr.size > 0):
+    smooth.kinematics(m, d_bwd)
+    smooth.com_pos(m, d_bwd)
+  else:
+    smooth.kinematics1(m, d_bwd)
   forward_adjoint.kinematics_backward(m, d, d_bwd, bc)
+  if tendon_grad:
+    tendon_adjoint.tendon_kinematics_backward(m, d, d_bwd, bc)
   _write_kinematics_adjoints(d, bc)
 
 
@@ -936,8 +1041,9 @@ def enable_grad() -> None:
   independently of tapes and backward-hook registration.
 
   Mocap input gradients are opt-in via requires_grad.
-  Kinematic output gradients support site_xpos, xpos, and xquat. Step computes these
-  before integration; call fwd_kinematics on the output to refresh them using the updated qpos.
+  Kinematic output gradients support site_xpos, xpos, xquat, ten_length, and ten_J. Step
+  computes these before integration; call fwd_kinematics on the output to refresh them
+  using the updated qpos.
 
   Backward reductions are nondeterministic, regardless of forward determinism options.
   """
